@@ -6,11 +6,22 @@ import pandas as pd
 import psycopg2
 import io
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 
 # 1. Creamos una "instancia" de FastAPI. 
 # La variable 'app' será el punto central de toda nuestra API.
 app = FastAPI()
+
+# Un middleware es código que se ejecuta en medio de la petición y la respuesta, agregaremos uno para comunicar el back y el front
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # Permite peticiones desde tu frontend de React
+    allow_credentials=True,
+    allow_methods=["*"],  # Permite todos los métodos (GET, POST, etc.)
+    allow_headers=["*"],  # Permite todos los headers
+)
+
 
 # 2. Creamos nuestro primer "endpoint".
 # Un endpoint es como una URL específica que realiza una acción.
@@ -26,6 +37,8 @@ def read_root():
 class QueryRequest(BaseModel): # al heredar de BaseModel se le dan poderes de validacion de datos que indica los errores automáticamente sin escribir las validaciones manualmente
     columns: List[str] = Field(default_factory=list) # esperamos una lista de textos (columnas), si no se envía hacemos una vacía
     table : str
+    file_type: str = 'xlsx' # tipo de archivo que da para descarga
+
 
 # 4. Nos conectamos con PostgreSQL para ejecutar consultas
 # se crea la lógica para hablar con la base de datos, lo hacemos en una función separada como buena práctica
@@ -84,10 +97,15 @@ def download_file(request: QueryRequest):
     # 2. Creamos un "archivo virtual" en la memoria RAM del servidor para no escribir y luego leer un archivo desde el disco duro
     buffer = io.BytesIO()
     
-    # 3. Guardamos el DataFrame en el buffer en tipo xlsx
-    df.to_excel(buffer, index=False, engine='openpyxl')
-    media_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    filename = 'resultado.xlsx'
+    # 3. Guardamos el DataFrame en el buffer según el tipo de archivo
+    if request.file_type == 'xlsx':
+        df.to_excel(buffer, index=False, engine='openpyxl')
+        media_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        filename = 'resultado.xlsx'
+    else: # Por defecto es CSV
+        df.to_csv(buffer, index=False, encoding='utf-8')
+        media_type = 'text/csv'
+        filename = 'resultado.csv'
 
         
     # 4. Rebobinamos el buffer al principio para que pueda ser leído
@@ -99,4 +117,34 @@ def download_file(request: QueryRequest):
         media_type=media_type,
         headers={'Content-Disposition': f'attachment; filename={filename}'}
     )
+
+# 7. Endpoint para crar la lista de tablas y columnas para mostrar en el frontend
+@app.get("/api/schema")
+def get_schema():
+    conn = psycopg2.connect(
+        database=DB_NAME, user=DB_USER, password=DB_PASS, host=DB_HOST, port=DB_PORT
+    )
+    cursor = conn.cursor()
+    # Obtener todas las tablas del esquema app_sql
+    cursor.execute("""
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'app_sql'
+    """)
+    tables = [row[0] for row in cursor.fetchall()]
+    
+    schema = {}
+    for table in tables:
+        # Obtener las columnas para cada tabla
+        cursor.execute(f"""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_schema = 'app_sql' AND table_name = '{table}'
+        """)
+        columns = [row[0] for row in cursor.fetchall()]
+        schema[table] = columns
+        
+    cursor.close()
+    conn.close()
+    return schema
 
