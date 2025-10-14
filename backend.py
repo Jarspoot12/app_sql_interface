@@ -8,6 +8,7 @@ import io
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import datetime
+from typing import List, Literal, Optional, Union
 
 
 # 1. Creamos una "instancia" de FastAPI. 
@@ -37,8 +38,8 @@ def read_root():
 #    Usamos Literal para restringir los valores a solo los que permitimos
 class FilterCondition(BaseModel):
     column: str
-    operator: Literal['=', '!=', '>', '>=', '<', '<=', 'startswith', 'endswith', 'contains']
-    value: str
+    operator: Literal['=', '!=', '>', '>=', '<', '<=', 'startswith', 'endswith', 'contains', 'between']
+    value: Union[str, List[str]]
     logical: Optional[Literal['AND', 'OR']] = 'AND' # AND por defecto
 
 # 3. Este es nuestro "molde" o "contrato" definido con Pydantic.
@@ -75,10 +76,6 @@ def run_query(sql_query: str, params=None):
     
 #función para construir la cláusula WHERE de los filtros
 def build_where_clause(filters: List[FilterCondition], table_schema: List[dict]):
-    """
-    Construye de forma segura una cláusula WHERE y una lista de parámetros para evitar inyección SQL.
-    Esta versión es consciente de los tipos de datos.
-    """
     if not filters:
         return "", []
 
@@ -88,11 +85,38 @@ def build_where_clause(filters: List[FilterCondition], table_schema: List[dict])
     params = []
     
     for i, f in enumerate(filters):
-        allowed_columns = column_type_map.keys()
-        if f.column not in allowed_columns:
-            print(f"Advertencia: Se intentó filtrar por una columna no permitida: {f.column}")
+        # ... (la validación de columna es la misma) ...
+        if f.column not in column_type_map.keys():
             continue
 
+        logical_connector = f" {f.logical}" if i > 0 else ""
+        column_type = column_type_map.get(f.column)
+
+        # --- LÓGICA PARA EL OPERADOR 'BETWEEN' ---
+        if f.operator == 'between':
+            # Verificamos que 'value' sea una lista con 2 elementos
+            if isinstance(f.value, list) and len(f.value) == 2:
+                val1, val2 = f.value
+                # Convertimos ambos valores al tipo de dato correcto
+                try:
+                    # Lógica de conversión de tipos para los dos valores
+                    if column_type in ('integer', 'bigint', 'numeric', 'real', 'double precision'):
+                        param1 = float(val1) if '.' in val1 else int(val1)
+                        param2 = float(val2) if '.' in val2 else int(val2)
+                    elif column_type in ('date', 'timestamp'):
+                        param1 = datetime.date.fromisoformat(val1)
+                        param2 = datetime.date.fromisoformat(val2)
+                    else: # Si es texto, lo dejamos como está (aunque between en texto es raro), pero para evitar romper el programa
+                        param1, param2 = val1, val2
+
+                    query_parts.append(f'{logical_connector} "{f.column}" BETWEEN %s AND %s')
+                    params.extend([param1, param2])
+                except (ValueError, TypeError):
+                    print(f"Advertencia: valores para BETWEEN no válidos en '{f.column}'")
+                    continue
+            continue # Pasamos al siguiente filtro si 'between' no es válido
+
+        # --- LÓGICA PARA LOS OTROS OPERADORES (YA EXISTENTE CON MEJORAS) ---
         operator_map = {
             '=': '=', '!=': '!=', '>': '>', '>=': '>=', '<': '<', '<=': '<=',
             'startswith': 'LIKE', 'endswith': 'LIKE', 'contains': 'LIKE'
@@ -100,34 +124,38 @@ def build_where_clause(filters: List[FilterCondition], table_schema: List[dict])
         sql_operator = operator_map[f.operator]
         
         value_to_process = f.value
-        column_type = column_type_map.get(f.column)
         final_value = value_to_process
 
-        try:
-            if column_type in ('integer', 'bigint', 'smallint', 'numeric', 'real', 'double precision'):
-                final_value = float(value_to_process) if '.' in value_to_process else int(value_to_process)
-            elif column_type in ('date', 'timestamp', 'timestamp without time zone'):
-                final_value = datetime.date.fromisoformat(value_to_process)
-        except (ValueError, TypeError):
-            print(f"Advertencia: no se pudo convertir '{value_to_process}' para la columna '{f.column}'")
-            final_value = value_to_process
+        # --- LÓGICA DE NORMALIZACIÓN Y CONVERSIÓN DE TIPO ---
+        is_text_type = 'char' in column_type or 'text' in column_type
         
-        if f.operator in ['startswith', 'endswith', 'contains']:
-            if f.operator == 'startswith':
-                final_value = f"{final_value}%"
-            elif f.operator == 'endswith':
-                final_value = f"%{final_value}"
-            elif f.operator == 'contains':
-                final_value = f"%{final_value}%"
-        
-        logical_connector = f" {f.logical}" if i > 0 else ""
-        query_parts.append(f'{logical_connector} "{f.column}" {sql_operator} %s')
+        # 1. Normalización a mayúsculas para tipos de texto
+        if is_text_type:
+            final_value = str(value_to_process).upper()
+            
+            # Preparar valor para LIKE
+            if f.operator == 'startswith': final_value = f"{final_value}%"
+            elif f.operator == 'endswith': final_value = f"%{final_value}"
+            elif f.operator == 'contains': final_value = f"%{final_value}%"
+
+            # Añadimos UPPER() a la columna en la consulta para una comparación insensible a mayúsculas
+            query_parts.append(f'{logical_connector} UPPER("{f.column}") {sql_operator} %s')
+        else: # Para números y fechas
+            try:
+                if column_type in ('integer', 'bigint', 'numeric', 'real', 'double precision'):
+                    final_value = float(value_to_process) if '.' in value_to_process else int(value_to_process)
+                elif column_type in ('date', 'timestamp'):
+                    final_value = datetime.date.fromisoformat(value_to_process)
+            except (ValueError, TypeError):
+                print(f"Advertencia: no se pudo convertir '{value_to_process}' para la columna '{f.column}'")
+
+            query_parts.append(f'{logical_connector} "{f.column}" {sql_operator} %s')
+
         params.append(final_value)
 
     if not query_parts:
         return "", []
 
-    # Se construye con un espacio inicial para que se una correctamente a la consulta principal
     full_where_clause = "WHERE" + "".join(query_parts)
     return full_where_clause, params
 
@@ -177,7 +205,7 @@ def download_file(request: QueryRequest):
         df.to_excel(buffer, index=False, engine='openpyxl')
         media_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         filename = 'resultado.xlsx'
-    else: # Por defecto es CSV
+    else: # es CSV
         df.to_csv(buffer, index=False, encoding='utf-8')
         media_type = 'text/csv'
         filename = 'resultado.csv'
