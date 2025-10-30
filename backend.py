@@ -1,234 +1,201 @@
+# -*- coding: utf-8 -*-
 # archivo que contiene toda la lógica del backend
 from fastapi import FastAPI
-from pydantic import BaseModel, Field #-> para definir el molde de lo que esperamos del frontend
-from typing import List, Literal, Optional
+from pydantic import BaseModel, Field
+from typing import List, Literal, Optional, Union, Tuple
 import pandas as pd
 import psycopg2
 import io
+import datetime
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import datetime
-from typing import List, Literal, Optional, Union
 
-
-# 1. Creamos una "instancia" de FastAPI. 
-# La variable 'app' será el punto central de toda nuestra API.
+# 1. Creamos una "instancia" de FastAPI.
 app = FastAPI()
 
-# Un middleware es código que se ejecuta en medio de la petición y la respuesta, agregaremos uno para comunicar el back y el front
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Permite peticiones desde tu frontend de React
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
-    allow_methods=["*"],  # Permite todos los métodos (GET, POST, etc.)
-    allow_headers=["*"],  # Permite todos los headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-
-# 2. Creamos nuestro primer "endpoint".
-# Un endpoint es como una URL específica que realiza una acción.
-@app.get("/") #-> esto es lo que en FastAPI se llama decorador 
-def read_root():
-    return {"message": "¡Hola! Mi servidor SQL está funcionando:)."}
-@app.get("/home")
-def read_root():
-    return {"Esto es una prueba de un nuevo endpoint con el método get."}
-
-# buscamos que FastAPI entienda la lógica de los filtros, por lo que se crea un nuevo modelo pydantic para una condición de filtro, lo añadimos al QueryRequest
-#    Usamos Literal para restringir los valores a solo los que permitimos
+# --- Modelos de Datos Pydantic ---
 class FilterCondition(BaseModel):
     column: str
     operator: Literal['=', '!=', '>', '>=', '<', '<=', 'startswith', 'endswith', 'contains', 'between']
     value: Union[str, List[str]]
-    logical: Optional[Literal['AND', 'OR']] = 'AND' # AND por defecto
+    logical: Optional[Literal['AND', 'OR']] = 'AND'
 
-# 3. Este es nuestro "molde" o "contrato" definido con Pydantic.
-class QueryRequest(BaseModel): # al heredar de BaseModel se le dan poderes de validacion de datos que indica los errores automáticamente sin escribir las validaciones manualmente
-    columns: List[str] = Field(default_factory=list) # esperamos una lista de textos (columnas), si no se envía hacemos una vacía
-    table : str
-    filters: List[FilterCondition] = Field(default_factory=list) # <-- Añadimos para los filtros
-    file_type: str = 'xlsx' # tipo de archivo que da para descarga por defecto
+class QueryRequest(BaseModel):
+    table: str
+    columns: List[str] = Field(default_factory=list)
+    filters: List[FilterCondition] = Field(default_factory=list)
+    file_type: str = 'xlsx'
+
+# --- Configuración de la Base de Datos ---
+DB_NAME = 'app_sql'
+DB_USER = 'app_ri_user'
+DB_PASS = '1234'
+DB_HOST = 'localhost'
+DB_PORT = '5432'
+
+# --- Funciones Auxiliares de Lógica ---
+
+def _process_single_condition(f: FilterCondition, col_type: str) -> Tuple[Optional[str], List, Optional[str]]:
+    """
+    Función auxiliar interna.
+    Procesa una única condición de filtro.
+    Devuelve: (fragmento_sql, lista_de_parametros, texto_legible_para_case)
+    """
+    sql_snippet = None
+    params_snippet = []
+    case_string = None
+    
+    try:
+        # 1. Crear el texto legible (ej. "folio: 11111")
+        if f.operator == 'between':
+            if isinstance(f.value, list) and len(f.value) == 2:
+                case_string = f"{f.column}: {f.value[0]} / {f.value[1]}"
+            else:
+                return None, [], None # 'between' mal formado
+        else:
+            case_string = f"{f.column}: {f.value}"
+
+        # 2. Construir el fragmento de SQL y los parámetros
+        if f.operator == 'between':
+            val1, val2 = f.value
+            if col_type in ('integer', 'bigint', 'numeric', 'real', 'double precision'):
+                param1, param2 = (float(val1) if '.' in val1 else int(val1)), (float(val2) if '.' in val2 else int(val2))
+            elif 'date' in col_type or 'timestamp' in col_type:
+                param1, param2 = datetime.date.fromisoformat(val1), datetime.date.fromisoformat(val2)
+            else:
+                param1, param2 = val1, val2 # 'between' para texto
+            
+            sql_snippet = f'"{f.column}" BETWEEN %s AND %s'
+            params_snippet = [param1, param2]
+        
+        else: # Todos los demás operadores
+            operator_map = {'=': '=', '!=': '!=', '>': '>', '>=': '>=', '<': '<', '<=': '<=', 'startswith': 'LIKE', 'endswith': 'LIKE', 'contains': 'LIKE'}
+            sql_operator = operator_map.get(f.operator)
+            if not sql_operator: return None, [], None
+
+            value_to_process = str(f.value)
+            final_value = value_to_process
+            is_text_type = 'char' in col_type or 'text' in col_type
+            
+            if is_text_type:
+                final_value = value_to_process.upper() # Normalización a mayúsculas
+                if f.operator == 'startswith': final_value = f"{final_value}%"
+                elif f.operator == 'endswith': final_value = f"%{final_value}"
+                elif f.operator == 'contains': final_value = f"%{final_value}%"
+                sql_snippet = f'UPPER("{f.column}") {sql_operator} %s'
+            else:
+                if col_type in ('integer', 'bigint', 'numeric', 'real', 'double precision'):
+                    final_value = float(value_to_process) if '.' in value_to_process else int(value_to_process)
+                elif 'date' in col_type or 'timestamp' in col_type:
+                    final_value = datetime.date.fromisoformat(value_to_process)
+                sql_snippet = f'"{f.column}" {sql_operator} %s'
+            
+            params_snippet = [final_value]
+    
+    except (ValueError, TypeError, AttributeError, IndexError):
+        print(f"Advertencia: Valor de filtro no válido para {f.column}")
+        return None, [], None
+
+    return sql_snippet, params_snippet, case_string
 
 
-# 4. Nos conectamos con PostgreSQL para ejecutar consultas
-# se crea la lógica para hablar con la base de datos, lo hacemos en una función separada como buena práctica
-DB_NAME = 'app_sql' # Complejo
-DB_USER = 'app_ri_user' # postgres
-DB_PASS = '1234'  # ComplejoC5
-DB_HOST = 'localhost' # localhost del c5 si es en la misma máquina
-DB_PORT = '5432' # 5432
+def build_filter_logic(filters: List[FilterCondition], table_schema: List[dict]):
+    """
+    Construye la lógica de filtrado completa para WHERE y CASE.
+    Devuelve: (where_clause_sql, case_clause_sql, case_params_list, where_only_params)
+    """
+    if not filters:
+        return "", "", [], []
 
-# --- Función para ejecutar la consulta ---
+    column_type_map = {col["column_name"]: col["data_type"] for col in table_schema}
+    
+    case_params = []        # Parámetros para la consulta SELECT (incluye CASE)
+    where_only_params = []  # Parámetros solo para la consulta WHERE (para la descarga)
+    where_groups_sql = []   # Grupos 'OR' de 'AND's. Ej: ["(A AND B)", "(C)"]
+    case_whens_sql = []     # Lista de 'WHEN ... THEN ...'
+    
+    current_and_sql = []
+    current_and_params = []
+    current_and_case_strings = []
+
+    def finalize_group(sql_parts, params, case_strings):
+        """Función interna para procesar un grupo de ANDs"""
+        if not sql_parts:
+            return
+        
+        group_sql = f"({' AND '.join(sql_parts)})"
+        where_groups_sql.append(group_sql)
+        
+        case_match_string = '; '.join(case_strings)
+        case_whens_sql.append(f"WHEN {group_sql} THEN %s")
+        
+        case_params.extend(params)
+        case_params.append(case_match_string)
+
+    for i, f in enumerate(filters):
+        if f.column not in column_type_map:
+            continue
+        
+        col_type = column_type_map.get(f.column)
+        sql_part, params_part, case_str = _process_single_condition(f, col_type)
+        
+        if not sql_part:
+            continue
+            
+        where_only_params.extend(params_part)
+
+        if f.logical == 'OR' and i > 0:
+            finalize_group(current_and_sql, current_and_params, current_and_case_strings)
+            current_and_sql = [sql_part]
+            current_and_params = params_part
+            current_and_case_strings = [case_str]
+        else:
+            current_and_sql.append(sql_part)
+            current_and_params.extend(params_part)
+            current_and_case_strings.append(case_str)
+            
+    finalize_group(current_and_sql, current_and_params, current_and_case_strings)
+
+    if not where_groups_sql:
+        return "", "", [], []
+
+    final_where_clause = "WHERE " + " OR ".join(where_groups_sql)
+    final_case_clause = f"(CASE {' '.join(case_whens_sql)} ELSE 'Coincidencia no agrupada' END) AS \"Coincidencia de Filtro\""
+    
+    return final_where_clause, final_case_clause, case_params, where_only_params
+
 def run_query(sql_query: str, params=None):
     try:
-        # 1. Establece la conexión con la base de datos
         conn = psycopg2.connect(
             database=DB_NAME, user=DB_USER, password=DB_PASS, host=DB_HOST, port=DB_PORT
         )
-        # 2. Usa Pandas para ejecutar la consulta y cargar los resultados en una tabla (DataFrame)
-        df = pd.read_sql_query(sql_query, conn, params=params) # pasamos la consulta y la conexión como parámetros
-        # 3. Cierra la conexión para liberar recursos
+        df = pd.read_sql_query(sql_query, conn, params=params)
         conn.close()
         return df
     except Exception as e:
         print(f"Error al ejecutar la consulta: {e} \n Intente nuevamente.")
-        return pd.DataFrame() # Devuelve una tabla vacía si hay un error
-    
-#función para construir la cláusula WHERE de los filtros
-def build_where_clause(filters: List[FilterCondition], table_schema: List[dict]):
-    if not filters:
-        return "", []
+        return pd.DataFrame()
 
-    column_type_map = {col["column_name"]: col["data_type"] for col in table_schema}
-    
-    query_parts = []
-    params = []
-    
-    for i, f in enumerate(filters):
-        # ... (la validación de columna es la misma) ...
-        if f.column not in column_type_map.keys():
-            continue
+# --- Endpoints de la API ---
 
-        logical_connector = f" {f.logical}" if i > 0 else ""
-        column_type = column_type_map.get(f.column)
+@app.get("/")
+def read_root():
+    return {"message": "¡Hola! Mi servidor SQL está funcionando:)."}
 
-        # --- LÓGICA PARA EL OPERADOR 'BETWEEN' ---
-        if f.operator == 'between':
-            # Verificamos que 'value' sea una lista con 2 elementos
-            if isinstance(f.value, list) and len(f.value) == 2:
-                val1, val2 = f.value
-                # Convertimos ambos valores al tipo de dato correcto
-                try:
-                    # Lógica de conversión de tipos para los dos valores
-                    if column_type in ('integer', 'bigint', 'numeric', 'real', 'double precision'):
-                        param1 = float(val1) if '.' in val1 else int(val1)
-                        param2 = float(val2) if '.' in val2 else int(val2)
-                    elif column_type in ('date', 'timestamp'):
-                        param1 = datetime.date.fromisoformat(val1)
-                        param2 = datetime.date.fromisoformat(val2)
-                    else: # Si es texto, lo dejamos como está (aunque between en texto es raro), pero para evitar romper el programa
-                        param1, param2 = val1, val2
-
-                    query_parts.append(f'{logical_connector} "{f.column}" BETWEEN %s AND %s')
-                    params.extend([param1, param2])
-                except (ValueError, TypeError):
-                    print(f"Advertencia: valores para BETWEEN no válidos en '{f.column}'")
-                    continue
-            continue # Pasamos al siguiente filtro si 'between' no es válido
-
-        # --- LÓGICA PARA LOS OTROS OPERADORES (YA EXISTENTE CON MEJORAS) ---
-        operator_map = {
-            '=': '=', '!=': '!=', '>': '>', '>=': '>=', '<': '<', '<=': '<=',
-            'startswith': 'LIKE', 'endswith': 'LIKE', 'contains': 'LIKE'
-        }
-        sql_operator = operator_map[f.operator]
-        
-        value_to_process = f.value
-        final_value = value_to_process
-
-        # --- LÓGICA DE NORMALIZACIÓN Y CONVERSIÓN DE TIPO ---
-        is_text_type = 'char' in column_type or 'text' in column_type
-        
-        # 1. Normalización a mayúsculas para tipos de texto
-        if is_text_type:
-            final_value = str(value_to_process).upper()
-            
-            # Preparar valor para LIKE
-            if f.operator == 'startswith': final_value = f"{final_value}%"
-            elif f.operator == 'endswith': final_value = f"%{final_value}"
-            elif f.operator == 'contains': final_value = f"%{final_value}%"
-
-            # Añadimos UPPER() a la columna en la consulta para una comparación insensible a mayúsculas
-            query_parts.append(f'{logical_connector} UPPER("{f.column}") {sql_operator} %s')
-        else: # Para números y fechas
-            try:
-                if column_type in ('integer', 'bigint', 'numeric', 'real', 'double precision'):
-                    final_value = float(value_to_process) if '.' in value_to_process else int(value_to_process)
-                elif column_type in ('date', 'timestamp'):
-                    final_value = datetime.date.fromisoformat(value_to_process)
-            except (ValueError, TypeError):
-                print(f"Advertencia: no se pudo convertir '{value_to_process}' para la columna '{f.column}'")
-
-            query_parts.append(f'{logical_connector} "{f.column}" {sql_operator} %s')
-
-        params.append(final_value)
-
-    if not query_parts:
-        return "", []
-
-    full_where_clause = "WHERE" + "".join(query_parts)
-    return full_where_clause, params
-
-# 5. Creamos el endpoint (ruta) para el preview de datos
-# recibe los parámetros del front , usa run_query y devuelve las primeras 20 filas
-@app.post("/api/query") # Como necesitas enviar un cuerpo de datos para que el servidor procese tu solicitud, se debe usar POST.
-def handle_query(request: QueryRequest):
-    # 1. Construimos la consulta SQL de forma segura
-    cols = ", ".join(request.columns) if request.columns else "*" # columnas a extraer
-    table_name = request.table # tabla objetivo
-    # obtenemos columnas permitidas para validación
-    schema = get_schema() # Reutilizamos la función del endpoint /api/schema
-    table_schema_data = schema.get(request.table, []) # Esto es la lista de objetos con tipos de dato
-    where_clause, params = build_where_clause(request.filters, table_schema_data)
-
-    # consulta en lenguaje SQL
-    query = f"SELECT {cols} FROM {table_name} {where_clause};"
-    
-    # 2. Ejecutamos la consulta usando nuestra función
-    df = run_query(query, params)
-    
-    # 3. Preparamos y devolvemos el preview
-    # .head(20) toma las primeras 20 filas
-    # .to_dict(orient='records') convierte la tabla a un formato JSON ideal para el frontend
-    preview_data = df.head(20).to_dict(orient='records')
-    return preview_data
-
-# 6. Crear el endpoint para descargar archivos
-# aquí, en lugar de devolver un JSON devolvemos un archivo completo
-@app.post("/api/download")
-def download_file(request: QueryRequest):
-    # 1. Construcción y ejecución de la consulta (igual que antes)
-    cols = ", ".join(request.columns) if request.columns else "*"
-    table_name = request.table
-    schema = get_schema() # Reutilizamos la función del endpoint /api/schema
-    table_schema_data = schema.get(request.table, []) # Esto es la lista de objetos con tipos de dato
-    where_clause, params = build_where_clause(request.filters, table_schema_data)
-
-    query = f"SELECT {cols} FROM {table_name} {where_clause};"
-    df = run_query(query, params)
-    
-    # 2. Creamos un "archivo virtual" en la memoria RAM del servidor para no escribir y luego leer un archivo desde el disco duro
-    buffer = io.BytesIO()
-    
-    # 3. Guardamos el DataFrame en el buffer según el tipo de archivo
-    if request.file_type == 'xlsx':
-        df.to_excel(buffer, index=False, engine='openpyxl')
-        media_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        filename = 'resultado.xlsx'
-    else: # es CSV
-        df.to_csv(buffer, index=False, encoding='utf-8')
-        media_type = 'text/csv'
-        filename = 'resultado.csv'
-
-        
-    # 4. Rebobinamos el buffer al principio para que pueda ser leído
-    buffer.seek(0)
-    
-    # 5. Devolvemos el buffer como una respuesta de archivo
-    return StreamingResponse( # forma de FastAPI para enviar archivos o grandes cantidades de datos
-        buffer,
-        media_type=media_type,
-        headers={'Content-Disposition': f'attachment; filename={filename}'}
-    )
-
-# 7. Endpoint para crar la lista de tablas y columnas para mostrar en el frontend
 @app.get("/api/schema")
 def get_schema():
     conn = psycopg2.connect(
         database=DB_NAME, user=DB_USER, password=DB_PASS, host=DB_HOST, port=DB_PORT
     )
     cursor = conn.cursor()
-    # Obtener todas las tablas del esquema app_sql
     cursor.execute("""
         SELECT table_name 
         FROM information_schema.tables 
@@ -238,7 +205,6 @@ def get_schema():
     
     schema = {}
     for table in tables:
-        # Obtener las columnas para cada tabla
         cursor.execute(f"""
             SELECT column_name, data_type 
             FROM information_schema.columns 
@@ -251,3 +217,78 @@ def get_schema():
     conn.close()
     return schema
 
+@app.post("/api/query")
+def handle_query(request: QueryRequest):
+    # Usar comillas dobles para nombres de columnas y tablas
+    cols_list = [f'"{c}"' for c in request.columns] if request.columns else ["*"]
+    cols = ", ".join(cols_list)
+    table_name = f'"{request.table}"'
+    
+    schema = get_schema()
+    table_schema_data = schema.get(request.table, [])
+    
+    # --- INICIO DE LA CORRECCIÓN ---
+    # 1. Capturar TODOS los parámetros devueltos
+    where_sql, case_sql, case_params, where_only_params = build_filter_logic(request.filters, table_schema_data)
+
+    if case_sql:
+        # Si hay filtros, construimos la consulta completa
+        
+        # Manejar el SELECT * correctamente con la nueva columna
+        if cols == "*":
+            query = f"SELECT {table_name}.*, {case_sql} FROM {table_name} {where_sql};"
+        else:
+            query = f"SELECT {cols}, {case_sql} FROM {table_name} {where_sql};"
+        
+        # 2. Combinar las DOS listas de parámetros correctas
+        #    Los parámetros del CASE (WHEN...THEN...) + los parámetros del WHERE
+        params_totales = case_params + where_only_params
+        df = run_query(query, params_totales)
+    else:
+        # Sin filtros, consulta normal
+        query = f"SELECT {cols} FROM {table_name};"
+        df = run_query(query) # No hay parámetros
+    
+    # --- FIN DE LA CORRECCIÓN ---
+    
+    total_count = len(df)
+    preview_data = df.head(20).to_dict(orient='records')
+    
+    return {
+        "totalCount": total_count,
+        "previewData": preview_data
+    }
+
+@app.post("/api/download")
+def download_file(request: QueryRequest):
+    cols_list = [f'"{c}"' for c in request.columns] if request.columns else ["*"]
+    cols = ", ".join(cols_list)
+    table_name = f'"{request.table}"'
+    
+    schema = get_schema()
+    table_schema_data = schema.get(request.table, [])
+    
+    # Solo necesitamos la lógica del WHERE para la descarga
+    where_sql, _, _, where_only_params = build_filter_logic(request.filters, table_schema_data)
+
+    # Consulta de descarga SIN la columna de coincidencia
+    query = f"SELECT {cols} FROM {table_name} {where_sql};"
+    
+    df = run_query(query, where_only_params)
+    
+    buffer = io.BytesIO()
+    if request.file_type == 'xlsx':
+        df.to_excel(buffer, index=False, engine='openpyxl')
+        media_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        filename = 'resultado.xlsx'
+    else:
+        df.to_csv(buffer, index=False, encoding='utf-8')
+        media_type = 'text/csv'
+        filename = 'resultado.csv'
+        
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type=media_type,
+        headers={'Content-Disposition': f'attachment; filename={filename}'}
+    )

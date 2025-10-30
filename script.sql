@@ -16,7 +16,7 @@ CREATE DATABASE app_sql
 -- en la BASE de trabajo (p.ej., app_sql)
 CREATE ROLE app_ri_user LOGIN PASSWORD '1234';
 
--- si vas a usar el ESQUEMA app_sql (que ya creaste):
+-- para usar el ESQUEMA app_sql:
 GRANT USAGE ON SCHEMA app_sql TO app_ri_user;
 
 -- permiso para crear tablas en el esquema
@@ -26,10 +26,10 @@ GRANT CREATE ON SCHEMA app_sql TO app_ri_user;
 ALTER DEFAULT PRIVILEGES IN SCHEMA app_sql
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_ri_user;
 
--- si ya existen tablas y quieres otorgar permisos:
+-- si ya existen tablas y se quiere otorgar permisos:
 -- GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA app_sql TO app_user;
 
--- (opcional) fijar search_path
+-- fijar search_path
 ALTER ROLE app_ri_user SET search_path = app_sql, public;
 
 

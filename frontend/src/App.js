@@ -24,6 +24,7 @@ function App() {
   const [previewData, setPreviewData] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [totalCount, setTotalCount] = useState(0);
 
   useEffect(() => {
     setLoading(true);
@@ -66,8 +67,8 @@ function App() {
 
     axios.post(`${API_URL}/api/query`, payload)
       .then(response => {
-        setPreviewData(response.data);
-        setLoading(false);
+        setPreviewData(response.data.previewData || []);
+        setTotalCount(response.data.totalCount || 0); setLoading(false);
       })
       .catch(err => {
         setError('Error al obtener el preview de los datos.');
@@ -342,6 +343,12 @@ return (
 
         {/* --- ALERTA Y TABLA (Sin cambios) --- */}
         {error && <Alert severity="error" sx={{ marginBottom: 2 }}>{error}</Alert>}
+        
+        {previewData.length > 0 && (
+          <Typography variant="h6" sx={{ marginBottom: 1 }}>
+            Mostrando {previewData.length} de {totalCount} registros encontrados.
+          </Typography>
+        )}
 
         {previewData.length > 0 && (
           <TableContainer component={Paper}>
