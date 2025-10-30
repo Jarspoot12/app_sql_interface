@@ -32,4 +32,5 @@ lo que hice al probar en localhost/docs desde el servidor uvicorn fue simular qu
 Instalaremos Node.js para usar React, se instala la versión LTS sin marcar la casilla de elementos adicionales, creamos un proyecto con npx create-react-app frontend y navegamos dentro de él. Instalamos dos librerías adicionales: MUI para tener componentes UI listos para usar y Axios para comunicarnos con el backend en FastAPI.
 
 Nuestro primer requisito nos pide crear un nuevo endpoint en la base de datos, lo llamaremos @app.get("/api/schema") que nos será útil para poblar las listas desplegables de tablas y columnas.
+
 Una vez establecido el middleware para permitir la conexión, ejecutamos cada capa en una terminal distinta para levartarlas al mismo tiempo.
